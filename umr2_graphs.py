@@ -4,8 +4,9 @@ UMR2 Graph Generator
 Generates graphs from UMR2 monitoring data.
 
 Features:
-- Temperature plot with E10 limit line
-- System status plot (pump, factor, CV)
+- Temperature plot with E10 limit line (55°C)
+- System status plot (heating/cooling factors, pump speed)
+- Heater/Cooler state visualization
 - Error markers
 - Time period filtering
 """
@@ -29,13 +30,15 @@ DEFAULT_HOURS = 24
 E10_TEMP_LIMIT = 55.0  # °C
 
 # Graph colors
-COLOR_SUPPLY = '#e74c3c'       # Red
-COLOR_RETURN = '#3498db'       # Blue
-COLOR_E10_LIMIT = '#e67e22'    # Orange
+COLOR_SUPPLY = '#e74c3c'          # Red
+COLOR_RETURN = '#3498db'          # Blue
+COLOR_E10_LIMIT = '#e67e22'       # Orange
 COLOR_HEATING_FACTOR = '#27ae60'  # Green
-COLOR_PUMP = '#9b59b6'         # Purple
-COLOR_CV = '#1abc9c'           # Teal
-COLOR_ERROR = '#c0392b'        # Dark red
+COLOR_COOLING_FACTOR = '#9b59b6'  # Purple
+COLOR_PUMP = '#1abc9c'            # Teal
+COLOR_HEATER = '#2ecc71'          # Light green
+COLOR_COOLER = '#3498db'          # Blue
+COLOR_ERROR = '#c0392b'           # Dark red
 
 # =============================================================================
 # Data Loading and Processing
@@ -77,17 +80,13 @@ def prepare_numeric_columns(df: pd.DataFrame) -> pd.DataFrame:
     """Convert string columns to numeric where applicable."""
     df = df.copy()
 
-    # Temperature columns - replace comma with dot for European format
+    # Temperature columns
     for col in ['supply_temp', 'return_temp']:
         if col in df.columns:
             df[col] = pd.to_numeric(
                 df[col].astype(str).str.replace(',', '.'),
                 errors='coerce'
             )
-
-    # Pump column
-    if 'pump' in df.columns:
-        df['pump'] = pd.to_numeric(df['pump'], errors='coerce')
 
     # Factor columns - remove % sign
     for col in ['heating_factor', 'cooling_factor']:
@@ -97,9 +96,17 @@ def prepare_numeric_columns(df: pd.DataFrame) -> pd.DataFrame:
                 errors='coerce'
             )
 
-    # CV status - convert to binary
-    if 'cv_status' in df.columns:
-        df['cv_binary'] = df['cv_status'].str.lower().isin(['aan', 'on', '1']).astype(int)
+    # Pump speed column
+    if 'pump_speed' in df.columns:
+        df['pump_speed'] = pd.to_numeric(df['pump_speed'], errors='coerce')
+
+    # Heater state - convert to binary
+    if 'heater_state' in df.columns:
+        df['heater_binary'] = df['heater_state'].str.lower().isin(['aan', 'on', '1']).astype(int)
+
+    # Cooler state - convert to binary
+    if 'cooler_state' in df.columns:
+        df['cooler_binary'] = df['cooler_state'].str.lower().isin(['aan', 'on', '1']).astype(int)
 
     return df
 
@@ -123,32 +130,50 @@ def create_temperature_graph(df: pd.DataFrame, save_path: str = None):
 
     - Supply temperature (red line)
     - Return temperature (blue line)
-    - E10 limit (orange dashed line)
+    - E10 limit (orange dashed line at 55°C)
     - Heating factor (green fill)
     - Error markers (red X)
     """
     fig, ax1 = plt.subplots(figsize=(14, 7))
+
+    # Check if we have temperature data
+    has_supply = 'supply_temp' in df.columns and df['supply_temp'].notna().any()
+    has_return = 'return_temp' in df.columns and df['return_temp'].notna().any()
+
+    if not has_supply and not has_return:
+        print("Warning: No temperature data available in log file.")
+        plt.close()
+        return
 
     # Temperature axis (left)
     ax1.set_xlabel('Time')
     ax1.set_ylabel('Temperature (°C)', color='black')
 
     # Plot temperatures
-    ax1.plot(df['timestamp'], df['supply_temp'],
-             color=COLOR_SUPPLY, label='Supply temp', linewidth=1.5)
-    ax1.plot(df['timestamp'], df['return_temp'],
-             color=COLOR_RETURN, label='Return temp', linewidth=1.5)
+    if has_supply:
+        ax1.plot(df['timestamp'], df['supply_temp'],
+                 color=COLOR_SUPPLY, label='Supply temp (aanvoer)', linewidth=1.5)
+    if has_return:
+        ax1.plot(df['timestamp'], df['return_temp'],
+                 color=COLOR_RETURN, label='Return temp (retour)', linewidth=1.5)
 
     # E10 limit line
     ax1.axhline(y=E10_TEMP_LIMIT, color=COLOR_E10_LIMIT,
                 linestyle='--', linewidth=2, label=f'E10 limit ({E10_TEMP_LIMIT}°C)')
 
     # Set reasonable y-axis range for temperature
-    temp_min = min(df['supply_temp'].min(), df['return_temp'].min())
-    temp_max = max(df['supply_temp'].max(), df['return_temp'].max())
-    y_min = max(0, temp_min - 5)
-    y_max = max(60, temp_max + 5)
-    ax1.set_ylim(y_min, y_max)
+    temp_values = []
+    if has_supply:
+        temp_values.extend(df['supply_temp'].dropna().tolist())
+    if has_return:
+        temp_values.extend(df['return_temp'].dropna().tolist())
+
+    if temp_values:
+        temp_min = min(temp_values)
+        temp_max = max(temp_values)
+        y_min = max(0, temp_min - 5)
+        y_max = max(60, temp_max + 5)
+        ax1.set_ylim(y_min, y_max)
 
     ax1.tick_params(axis='y')
 
@@ -157,14 +182,15 @@ def create_temperature_graph(df: pd.DataFrame, save_path: str = None):
     ax2.set_ylabel('Heating Factor (%)', color=COLOR_HEATING_FACTOR)
 
     # Fill area for heating factor
-    ax2.fill_between(df['timestamp'], 0, df['heating_factor'],
-                     alpha=0.3, color=COLOR_HEATING_FACTOR, label='Heating factor')
+    if 'heating_factor' in df.columns:
+        ax2.fill_between(df['timestamp'], 0, df['heating_factor'],
+                         alpha=0.3, color=COLOR_HEATING_FACTOR, label='Heating factor')
     ax2.set_ylim(0, 100)
     ax2.tick_params(axis='y', labelcolor=COLOR_HEATING_FACTOR)
 
     # Plot error markers on temperature line
     errors = get_error_points(df)
-    if not errors.empty:
+    if not errors.empty and has_supply:
         ax1.scatter(errors['timestamp'], errors['supply_temp'],
                     color=COLOR_ERROR, marker='x', s=100, linewidths=2,
                     label='Error', zorder=5)
@@ -198,62 +224,87 @@ def create_temperature_graph(df: pd.DataFrame, save_path: str = None):
 
 def create_system_status_graph(df: pd.DataFrame, save_path: str = None):
     """
-    Create system status graph with 3 subplots:
-    1. Temperatures
-    2. Pump + Heating factor
-    3. CV status (step plot)
+    Create system status graph with 4 subplots:
+    1. Temperatures with E10 limit
+    2. Heating/Cooling Factors
+    3. Pump Speed
+    4. Heater/Cooler Status (step plot)
     """
-    fig, axes = plt.subplots(3, 1, figsize=(14, 10), sharex=True)
+    fig, axes = plt.subplots(4, 1, figsize=(14, 12), sharex=True)
+
+    # Check if we have temperature data
+    has_supply = 'supply_temp' in df.columns and df['supply_temp'].notna().any()
+    has_return = 'return_temp' in df.columns and df['return_temp'].notna().any()
 
     # Subplot 1: Temperatures
     ax1 = axes[0]
-    ax1.plot(df['timestamp'], df['supply_temp'],
-             color=COLOR_SUPPLY, label='Supply temp', linewidth=1.5)
-    ax1.plot(df['timestamp'], df['return_temp'],
-             color=COLOR_RETURN, label='Return temp', linewidth=1.5)
+    if has_supply:
+        ax1.plot(df['timestamp'], df['supply_temp'],
+                 color=COLOR_SUPPLY, label='Supply temp', linewidth=1.5)
+    if has_return:
+        ax1.plot(df['timestamp'], df['return_temp'],
+                 color=COLOR_RETURN, label='Return temp', linewidth=1.5)
     ax1.axhline(y=E10_TEMP_LIMIT, color=COLOR_E10_LIMIT,
-                linestyle='--', linewidth=1.5, label=f'E10 limit')
+                linestyle='--', linewidth=1.5, label=f'E10 limit ({E10_TEMP_LIMIT}°C)')
     ax1.set_ylabel('Temperature (°C)')
     ax1.legend(loc='upper left')
     ax1.grid(True, alpha=0.3)
-    ax1.set_title('Temperatures')
+    ax1.set_title('Temperatures (Aanvoer & Retour)')
 
     # Error markers on temperature plot
     errors = get_error_points(df)
-    if not errors.empty:
+    if not errors.empty and has_supply:
         ax1.scatter(errors['timestamp'], errors['supply_temp'],
                     color=COLOR_ERROR, marker='x', s=80, linewidths=2, zorder=5)
 
-    # Subplot 2: Pump and Heating Factor
+    # Subplot 2: Heating/Cooling Factors
     ax2 = axes[1]
-    ax2.plot(df['timestamp'], df['pump'],
-             color=COLOR_PUMP, label='Pump', linewidth=1.5)
-    ax2.plot(df['timestamp'], df['heating_factor'],
-             color=COLOR_HEATING_FACTOR, label='Heating factor (%)', linewidth=1.5)
-    ax2.set_ylabel('Value')
-    ax2.set_ylim(0, 100)
+    if 'heating_factor' in df.columns:
+        ax2.plot(df['timestamp'], df['heating_factor'],
+                 color=COLOR_HEATING_FACTOR, label='Heating factor', linewidth=1.5)
+    if 'cooling_factor' in df.columns:
+        ax2.plot(df['timestamp'], df['cooling_factor'],
+                 color=COLOR_COOLING_FACTOR, label='Cooling factor', linewidth=1.5)
+    ax2.set_ylabel('Factor (%)')
+    ax2.set_ylim(0, 105)
     ax2.legend(loc='upper left')
     ax2.grid(True, alpha=0.3)
-    ax2.set_title('Pump & Heating Factor')
+    ax2.set_title('Heating & Cooling Factors')
 
-    # Subplot 3: CV Status
+    # Subplot 3: Pump Speed
     ax3 = axes[2]
-    if 'cv_binary' in df.columns:
-        ax3.fill_between(df['timestamp'], 0, df['cv_binary'],
-                         step='post', alpha=0.5, color=COLOR_CV, label='CV (on/off)')
-        ax3.step(df['timestamp'], df['cv_binary'],
-                 where='post', color=COLOR_CV, linewidth=1.5)
-    ax3.set_ylabel('CV Status')
-    ax3.set_ylim(-0.1, 1.1)
-    ax3.set_yticks([0, 1])
-    ax3.set_yticklabels(['Off', 'On'])
+    if 'pump_speed' in df.columns:
+        ax3.plot(df['timestamp'], df['pump_speed'],
+                 color=COLOR_PUMP, label='Pump speed', linewidth=1.5)
+    ax3.set_ylabel('Pump Speed')
+    ax3.set_ylim(0, 105)
     ax3.legend(loc='upper left')
     ax3.grid(True, alpha=0.3)
-    ax3.set_title('Central Heating (CV) Status')
+    ax3.set_title('Pump Speed')
+
+    # Subplot 4: Heater/Cooler Status
+    ax4 = axes[3]
+    if 'heater_binary' in df.columns:
+        ax4.fill_between(df['timestamp'], 0, df['heater_binary'] * 0.9,
+                         step='post', alpha=0.5, color=COLOR_HEATER, label='Heater (CV)')
+        ax4.step(df['timestamp'], df['heater_binary'] * 0.9,
+                 where='post', color=COLOR_HEATER, linewidth=1.5)
+    if 'cooler_binary' in df.columns:
+        ax4.fill_between(df['timestamp'], 1, 1 + df['cooler_binary'] * 0.9,
+                         step='post', alpha=0.5, color=COLOR_COOLER, label='Cooler (KM)')
+        ax4.step(df['timestamp'], 1 + df['cooler_binary'] * 0.9,
+                 where='post', color=COLOR_COOLER, linewidth=1.5)
+    ax4.set_ylabel('Status')
+    ax4.set_ylim(-0.1, 2.1)
+    ax4.set_yticks([0.45, 1.45])
+    ax4.set_yticklabels(['Heater', 'Cooler'])
+    ax4.legend(loc='upper left')
+    ax4.grid(True, alpha=0.3)
+    ax4.set_title('Heater (CV) & Cooler (KM) Status')
 
     # Format x-axis
-    ax3.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
-    ax3.xaxis.set_major_locator(mdates.AutoDateLocator())
+    ax4.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
+    ax4.xaxis.set_major_locator(mdates.AutoDateLocator())
     plt.xticks(rotation=45)
 
     # Overall title
@@ -294,62 +345,96 @@ def print_summary(df: pd.DataFrame):
     print(f"  Duration: {duration}")
     print(f"  Data points: {len(df)}")
 
-    # Temperature statistics
-    print(f"\nSupply Temperature:")
-    supply = df['supply_temp'].dropna()
-    if not supply.empty:
-        print(f"  Min:     {supply.min():.1f}°C")
-        print(f"  Max:     {supply.max():.1f}°C")
-        print(f"  Average: {supply.mean():.1f}°C")
-        print(f"  Current: {supply.iloc[-1]:.1f}°C")
+    # Supply temperature statistics
+    print(f"\nSupply Temperature (Aanvoer):")
+    if 'supply_temp' in df.columns:
+        supply = df['supply_temp'].dropna()
+        if not supply.empty:
+            print(f"  Min:     {supply.min():.1f}°C")
+            print(f"  Max:     {supply.max():.1f}°C")
+            print(f"  Average: {supply.mean():.1f}°C")
+            print(f"  Current: {supply.iloc[-1]:.1f}°C")
 
-        # Check how often it exceeded E10 limit
-        above_limit = (supply > E10_TEMP_LIMIT).sum()
-        if above_limit > 0:
-            print(f"  ⚠️  Exceeded {E10_TEMP_LIMIT}°C: {above_limit} times!")
+            # Check how often it exceeded E10 limit
+            above_limit = (supply > E10_TEMP_LIMIT).sum()
+            if above_limit > 0:
+                print(f"  ⚠️  Exceeded {E10_TEMP_LIMIT}°C: {above_limit} times!")
+        else:
+            print("  No data available")
     else:
         print("  No data available")
 
-    print(f"\nReturn Temperature:")
-    ret_temp = df['return_temp'].dropna()
-    if not ret_temp.empty:
-        print(f"  Min:     {ret_temp.min():.1f}°C")
-        print(f"  Max:     {ret_temp.max():.1f}°C")
-        print(f"  Average: {ret_temp.mean():.1f}°C")
-        print(f"  Current: {ret_temp.iloc[-1]:.1f}°C")
+    # Return temperature statistics
+    print(f"\nReturn Temperature (Retour):")
+    if 'return_temp' in df.columns:
+        ret_temp = df['return_temp'].dropna()
+        if not ret_temp.empty:
+            print(f"  Min:     {ret_temp.min():.1f}°C")
+            print(f"  Max:     {ret_temp.max():.1f}°C")
+            print(f"  Average: {ret_temp.mean():.1f}°C")
+            print(f"  Current: {ret_temp.iloc[-1]:.1f}°C")
+        else:
+            print("  No data available")
     else:
         print("  No data available")
+
+    # State statistics
+    print(f"\nSystem State:")
+    if 'state' in df.columns:
+        state_counts = df['state'].value_counts()
+        for state, count in state_counts.items():
+            pct = count / len(df) * 100
+            print(f"  {state}: {count} ({pct:.1f}%)")
 
     # Heating factor
     print(f"\nHeating Factor:")
-    factor = df['heating_factor'].dropna()
-    if not factor.empty:
-        print(f"  Min:     {factor.min():.0f}%")
-        print(f"  Max:     {factor.max():.0f}%")
-        print(f"  Average: {factor.mean():.1f}%")
-        print(f"  Current: {factor.iloc[-1]:.0f}%")
-    else:
-        print("  No data available")
+    if 'heating_factor' in df.columns:
+        factor = df['heating_factor'].dropna()
+        if not factor.empty:
+            print(f"  Min:     {factor.min():.0f}%")
+            print(f"  Max:     {factor.max():.0f}%")
+            print(f"  Average: {factor.mean():.1f}%")
+            print(f"  Current: {factor.iloc[-1]:.0f}%")
+        else:
+            print("  No data available")
 
-    # Pump
-    print(f"\nPump:")
-    pump = df['pump'].dropna()
-    if not pump.empty:
-        print(f"  Min:     {pump.min():.0f}")
-        print(f"  Max:     {pump.max():.0f}")
-        print(f"  Average: {pump.mean():.1f}")
-        print(f"  Current: {pump.iloc[-1]:.0f}")
-    else:
-        print("  No data available")
+    # Pump speed
+    print(f"\nPump Speed:")
+    if 'pump_speed' in df.columns:
+        pump = df['pump_speed'].dropna()
+        if not pump.empty:
+            print(f"  Min:     {pump.min():.0f}")
+            print(f"  Max:     {pump.max():.0f}")
+            print(f"  Average: {pump.mean():.1f}")
+            print(f"  Current: {pump.iloc[-1]:.0f}")
+        else:
+            print("  No data available")
 
-    # CV status
-    if 'cv_binary' in df.columns:
-        cv = df['cv_binary'].dropna()
-        if not cv.empty:
-            cv_on_pct = cv.mean() * 100
-            print(f"\nCV (Central Heating):")
-            print(f"  On:      {cv_on_pct:.1f}% of the time")
-            print(f"  Current: {'On' if cv.iloc[-1] == 1 else 'Off'}")
+    # Heater status
+    if 'heater_binary' in df.columns:
+        heater = df['heater_binary'].dropna()
+        if not heater.empty:
+            heater_on_pct = heater.mean() * 100
+            print(f"\nHeater (CV):")
+            print(f"  On:      {heater_on_pct:.1f}% of the time")
+            print(f"  Current: {'On' if heater.iloc[-1] == 1 else 'Off'}")
+
+    # Cooler status
+    if 'cooler_binary' in df.columns:
+        cooler = df['cooler_binary'].dropna()
+        if not cooler.empty:
+            cooler_on_pct = cooler.mean() * 100
+            print(f"\nCooler (KM):")
+            print(f"  On:      {cooler_on_pct:.1f}% of the time")
+            print(f"  Current: {'On' if cooler.iloc[-1] == 1 else 'Off'}")
+
+    # Mode statistics
+    print(f"\nOperating Mode:")
+    if 'mode' in df.columns:
+        mode_counts = df['mode'].value_counts()
+        for mode, count in mode_counts.items():
+            pct = count / len(df) * 100
+            print(f"  {mode}: {count} ({pct:.1f}%)")
 
     # Errors
     errors = get_error_points(df)

@@ -1,23 +1,21 @@
 #!/usr/bin/env python3
 """
 UMR2 Pro Monitoring System
-Monitors a WTH UMR2 Pro underfloor heating controller via its web interface.
+Monitors a WTH UMR2 Pro underfloor heating controller via its JSON API.
 
 Features:
-- Polls status every 60 seconds
-- Logs all data to CSV
-- Alerts on E10 errors (supply temperature >55°C)
+- Polls status every 60 seconds via JSON API
+- Logs all data to CSV including temperatures
+- Alerts on errors (E10 when supply temp >55C, etc.)
 - Optional Telegram notifications
 """
 
 import argparse
 import csv
 import os
-import re
 import sys
 import time
 from datetime import datetime
-from pathlib import Path
 from typing import Optional
 
 import requests
@@ -27,20 +25,21 @@ import requests
 # =============================================================================
 
 UMR_IP = "192.168.1.185"
-UMR_URL = f"http://{UMR_IP}/"
 POLL_INTERVAL = 60  # seconds
 LOG_FILE = "umr2_log.csv"
 ERROR_LOG_FILE = "umr2_errors.log"
 REQUEST_TIMEOUT = 10  # seconds
+
+# E10 temperature limit
+E10_TEMP_LIMIT = 55.0  # °C - supply temp above this triggers E10
 
 # Optional Telegram notifications
 TELEGRAM_ENABLED = False
 TELEGRAM_BOT_TOKEN = ""
 TELEGRAM_CHAT_ID = ""
 
-# Error codes to detect
+# Error codes to detect in message field
 ERROR_CODES = ["E10", "E11", "E21", "E22", "E30", "E90"]
-E10_TEMP_LIMIT = 55.0  # °C
 
 # =============================================================================
 # ANSI Color Codes
@@ -56,61 +55,22 @@ class Colors:
     BOLD = "\033[1m"
 
 # =============================================================================
-# HTML Parsing Patterns
-# =============================================================================
-
-# Regex patterns to extract values from UMR2 HTML
-# Format: (pattern, field_name)
-FIELD_PATTERNS = [
-    (r'Aanvoertemp[^<]*</div>\s*<input[^>]*value="([^"]*)"', 'supply_temp'),
-    (r'Retourtemp[^<]*</div>\s*<input[^>]*value="([^"]*)"', 'return_temp'),
-    (r'>Pomp<[^<]*</div>\s*<input[^>]*value="([^"]*)"', 'pump'),
-    (r'Verwarm\.?factor[^<]*</div>\s*<input[^>]*value="([^"]*)"', 'heating_factor'),
-    (r'Koel\s*factor[^<]*</div>\s*<input[^>]*value="([^"]*)"', 'cooling_factor'),
-    (r'Bedrijfsmodus[^<]*</div>\s*<input[^>]*value="([^"]*)"', 'operating_mode'),
-    (r'>CV<[^<]*</div>\s*<input[^>]*value="([^"]*)"', 'cv_status'),
-    (r'Koelmachine[^<]*</div>\s*<input[^>]*value="([^"]*)"', 'cooling_machine'),
-    (r'Maximaal\s*beveiliging[^<]*</div>\s*<input[^>]*value="([^"]*)"', 'max_protection'),
-    (r'Retour\s*begrenzing[^<]*</div>\s*<input[^>]*value="([^"]*)"', 'return_limitation'),
-    (r'Condens\s*beveiliging[^<]*</div>\s*<input[^>]*value="([^"]*)"', 'condensation_protection'),
-    (r'Status\s*\(display\)[^<]*</div>\s*<input[^>]*value="([^"]*)"', 'status_display'),
-    (r'Status\s*\(toelichting\)[^<]*</div>\s*<input[^>]*value="([^"]*)"', 'status_description'),
-]
-
-# Thermostat and output patterns (1-10)
-THERMOSTAT_PATTERN = r'Thermostaat\s*{n}[^<]*</div>\s*<input[^>]*value="([^"]*)"'
-OUTPUT_PATTERN = r'Uitgang\s*{n}[^<]*</div>\s*<input[^>]*value="([^"]*)"'
-
-# =============================================================================
 # CSV Field Order
 # =============================================================================
 
 CSV_FIELDS = [
     'timestamp',
-    'supply_temp',
-    'return_temp',
-    'pump',
-    'heating_factor',
-    'cooling_factor',
-    'operating_mode',
-    'cv_status',
-    'cooling_machine',
-    'max_protection',
-    'return_limitation',
-    'condensation_protection',
-    'status_display',
-    'status_description',
-    'error',
-    'thermostat_1', 'output_1',
-    'thermostat_2', 'output_2',
-    'thermostat_3', 'output_3',
-    'thermostat_4', 'output_4',
-    'thermostat_5', 'output_5',
-    'thermostat_6', 'output_6',
-    'thermostat_7', 'output_7',
-    'thermostat_8', 'output_8',
-    'thermostat_9', 'output_9',
-    'thermostat_10', 'output_10',
+    'supply_temp',     # aanvoertemperatuur (inputs.max.temperature)
+    'return_temp',     # retourtemperatuur (inputs.return.temperature)
+    'state',           # main.state - "OK" or error
+    'message',         # main.message - "OK" or error code like "E10"
+    'mode',            # heating/cooling/off
+    'heating_factor',  # 0-100%
+    'cooling_factor',  # 0-100%
+    'pump_speed',      # pump speed
+    'heater_state',    # on/off
+    'cooler_state',    # on/off
+    'error',           # detected errors
 ]
 
 # =============================================================================
@@ -132,69 +92,131 @@ class MonitorState:
 # Core Functions
 # =============================================================================
 
-def fetch_umr_html() -> Optional[str]:
-    """Fetch HTML from UMR2 web interface."""
+def fetch_json(endpoint: str) -> Optional[dict]:
+    """Fetch JSON data from UMR2 API endpoint."""
+    url = f"http://{UMR_IP}/{endpoint}"
     try:
-        response = requests.get(UMR_URL, timeout=REQUEST_TIMEOUT)
+        response = requests.get(url, timeout=REQUEST_TIMEOUT)
         response.raise_for_status()
-        return response.text
-    except requests.RequestException as e:
+        return response.json()
+    except requests.RequestException:
+        return None
+    except ValueError:  # JSON decode error
         return None
 
 
-def parse_umr_html(html: str) -> dict:
-    """Parse UMR2 HTML and extract all status fields."""
-    data = {}
-    flags = re.IGNORECASE | re.DOTALL
+def fetch_status() -> Optional[dict]:
+    """Fetch status data from UMR2 API."""
+    # Fetch main status
+    main_data = fetch_json("get.json?f=$.status.main.*")
+    if main_data is None:
+        return None
 
-    # Extract main fields
-    for pattern, field_name in FIELD_PATTERNS:
-        match = re.search(pattern, html, flags)
-        data[field_name] = match.group(1).strip() if match else ""
+    # Fetch outputs status
+    outputs_data = fetch_json("get.json?f=$.status.outputs.*")
+    if outputs_data is None:
+        return None
 
-    # Extract thermostat and output values (1-10)
-    for n in range(1, 11):
-        # Thermostat
-        pattern = THERMOSTAT_PATTERN.replace('{n}', str(n))
-        match = re.search(pattern, html, flags)
-        data[f'thermostat_{n}'] = match.group(1).strip() if match else ""
+    # Fetch supply temperature (aanvoertemperatuur) - inputs.max
+    supply_data = fetch_json("get.json?f=$.status.inputs.max.*")
 
-        # Output
-        pattern = OUTPUT_PATTERN.replace('{n}', str(n))
-        match = re.search(pattern, html, flags)
-        data[f'output_{n}'] = match.group(1).strip() if match else ""
+    # Fetch return temperature - inputs.return.temperature
+    return_data = fetch_json("get.json?f=$.status.inputs.return.temperature")
+
+    return {
+        'main': main_data.get('status', {}).get('main', {}),
+        'outputs': outputs_data.get('status', {}).get('outputs', {}),
+        'supply': supply_data.get('status', {}).get('inputs', {}).get('max', {}) if supply_data else {},
+        'return': return_data.get('status', {}).get('inputs', {}).get('return', {}) if return_data else {},
+    }
+
+
+def parse_temperature(value) -> Optional[float]:
+    """Parse temperature value, handling various formats."""
+    if value is None or value == '':
+        return None
+    try:
+        # Handle string with comma as decimal separator
+        if isinstance(value, str):
+            value = value.replace(',', '.')
+        return float(value)
+    except (ValueError, TypeError):
+        return None
+
+
+def parse_status_data(raw_data: dict) -> dict:
+    """Parse raw API data into our normalized format."""
+    main = raw_data.get('main', {})
+    outputs = raw_data.get('outputs', {})
+    supply = raw_data.get('supply', {})
+    return_data = raw_data.get('return', {})
+
+    # Mode translation
+    mode_map = {
+        'heating': 'verwarmen',
+        'cooling': 'koelen',
+        'off': 'uit',
+        'on': 'aan',
+    }
+
+    mode = main.get('mode', '')
+    mode_display = mode_map.get(mode, mode)
+
+    heater_state = outputs.get('heater', {}).get('state', '')
+    heater_display = mode_map.get(heater_state, heater_state)
+
+    cooler_state = outputs.get('cooler', {}).get('state', '')
+    cooler_display = mode_map.get(cooler_state, cooler_state)
+
+    # Parse temperatures
+    supply_temp = parse_temperature(supply.get('temperature'))
+    return_temp = parse_temperature(return_data.get('temperature'))
+
+    data = {
+        'supply_temp': supply_temp,
+        'return_temp': return_temp,
+        'state': main.get('state', ''),
+        'message': main.get('message', ''),
+        'mode': mode_display,
+        'heating_factor': f"{main.get('heatFactor', 0)}%",
+        'cooling_factor': f"{main.get('coolFactor', 0)}%",
+        'pump_speed': outputs.get('pump', {}).get('speed', 0),
+        'heater_state': heater_display,
+        'cooler_state': cooler_display,
+    }
 
     return data
 
 
-def detect_errors(data: dict, html: str) -> list:
-    """Detect error conditions from parsed data and raw HTML."""
+def detect_errors(data: dict) -> list:
+    """Detect error conditions from parsed data."""
     errors = []
 
-    # Check max_protection status
-    max_prot = data.get('max_protection', '').upper()
-    if max_prot and max_prot != 'OK':
-        errors.append(f"MAX_PROTECTION:{max_prot}")
-
-    # Check status_description for error codes
-    status_desc = data.get('status_description', '').upper()
-    for code in ERROR_CODES:
-        if code in status_desc:
-            errors.append(code)
-
-    # Check raw HTML for error codes (backup)
-    for code in ERROR_CODES:
-        if code in html and code not in errors:
-            errors.append(code)
-
     # Check supply temperature for E10 condition
-    try:
-        supply_temp = float(data.get('supply_temp', '0').replace(',', '.'))
-        if supply_temp > E10_TEMP_LIMIT:
-            if 'E10' not in errors:
-                errors.append(f"E10_THRESHOLD:{supply_temp}")
-    except ValueError:
-        pass
+    supply_temp = data.get('supply_temp')
+    if supply_temp is not None and supply_temp > E10_TEMP_LIMIT:
+        errors.append(f"E10(temp:{supply_temp:.1f}C)")
+
+    # Check main state
+    state = str(data.get('state', '')).upper()
+    if state and state != 'OK':
+        errors.append(f"STATE:{state}")
+
+    # Check message for error codes
+    message = str(data.get('message', '')).upper()
+    if message and message != 'OK':
+        # Check for known error codes
+        for code in ERROR_CODES:
+            if code in message:
+                # Don't duplicate E10 if we already detected it from temperature
+                if code == 'E10' and any('E10' in e for e in errors):
+                    continue
+                errors.append(code)
+                break
+        else:
+            # Unknown error in message
+            if message not in ['', 'OK']:
+                errors.append(f"MSG:{message}")
 
     return errors
 
@@ -206,7 +228,6 @@ def log_to_csv(data: dict, log_file: str):
     with open(log_file, 'a', newline='', encoding='utf-8') as f:
         writer = csv.DictWriter(f, fieldnames=CSV_FIELDS, extrasaction='ignore')
 
-        # Write header if file is new
         if not file_exists:
             writer.writeheader()
 
@@ -239,27 +260,32 @@ def send_telegram_notification(message: str) -> bool:
         return False
 
 
+def format_temp(temp: Optional[float]) -> str:
+    """Format temperature for display."""
+    if temp is None:
+        return "?"
+    return f"{temp:.1f}C"
+
+
 def format_status_line(data: dict, state: MonitorState, has_error: bool, errors: list) -> str:
     """Format a compact status line for console output."""
     timestamp = datetime.now().strftime("%H:%M:%S")
 
-    supply = data.get('supply_temp', '?')
-    ret = data.get('return_temp', '?')
-    pump = data.get('pump', '?')
-    factor = data.get('heating_factor', '?')
-    cv = data.get('cv_status', '?')
-
-    # Translate CV status
-    cv_display = 'on' if cv.lower() in ['aan', 'on', '1'] else 'off'
+    supply_temp = format_temp(data.get('supply_temp'))
+    return_temp = format_temp(data.get('return_temp'))
+    mode = data.get('mode', '?')
+    heat_factor = data.get('heating_factor', '?')
+    pump = data.get('pump_speed', '?')
+    heater = data.get('heater_state', '?')
 
     if has_error:
         status_icon = f"{Colors.RED}ERROR{Colors.RESET}"
         error_str = ', '.join(errors)
-        line = f"[{timestamp}] {status_icon} | Supply: {supply}°C | Return: {ret}°C | Pump: {pump} | Factor: {factor} | CV: {cv_display} | Polls: {state.poll_count} | Errors: {state.error_count}"
-        line += f"\n  {Colors.YELLOW}WARNING:{Colors.RESET} {error_str}"
+        line = f"[{timestamp}] {status_icon} | Supply: {supply_temp} | Return: {return_temp} | Mode: {mode} | Heat: {heat_factor} | Pump: {pump} | CV: {heater} | Polls: {state.poll_count}"
+        line += f"\n  {Colors.YELLOW}ALERT:{Colors.RESET} {error_str}"
     else:
         status_icon = f"{Colors.GREEN}OK{Colors.RESET}"
-        line = f"[{timestamp}] {status_icon} | Supply: {supply}°C | Return: {ret}°C | Pump: {pump} | Factor: {factor} | CV: {cv_display} | Polls: {state.poll_count} | Errors: {state.error_count}"
+        line = f"[{timestamp}] {status_icon} | Supply: {supply_temp} | Return: {return_temp} | Mode: {mode} | Heat: {heat_factor} | Pump: {pump} | CV: {heater} | Polls: {state.poll_count}"
 
     return line
 
@@ -274,19 +300,17 @@ def poll_once(state: MonitorState) -> dict:
     """Perform a single poll of the UMR2."""
     state.poll_count += 1
 
-    # Fetch HTML
-    html = fetch_umr_html()
+    # Fetch status data
+    raw_data = fetch_status()
 
-    if html is None:
+    if raw_data is None:
         state.consecutive_failures += 1
         print(format_connection_error_line(state))
 
-        # Log connection error
         error_data = {
             'timestamp': datetime.now().isoformat(),
             'error': 'CONNECTION_ERROR',
         }
-        # Fill other fields with empty strings
         for field in CSV_FIELDS:
             if field not in error_data:
                 error_data[field] = ''
@@ -297,11 +321,11 @@ def poll_once(state: MonitorState) -> dict:
     state.consecutive_failures = 0
 
     # Parse data
-    data = parse_umr_html(html)
+    data = parse_status_data(raw_data)
     data['timestamp'] = datetime.now().isoformat()
 
     # Detect errors
-    errors = detect_errors(data, html)
+    errors = detect_errors(data)
     has_error = len(errors) > 0
 
     if has_error:
@@ -309,38 +333,35 @@ def poll_once(state: MonitorState) -> dict:
         data['error'] = error_str
         state.error_count += 1
 
-        # Log to error file
-        log_error(f"Errors detected: {error_str} | Supply: {data.get('supply_temp')}°C", ERROR_LOG_FILE)
+        log_error(f"Errors: {error_str}", ERROR_LOG_FILE)
 
         # Send Telegram notification for NEW errors only
         if state.last_error != error_str:
             state.last_error = error_str
             state.last_error_time = datetime.now()
 
+            supply_temp = data.get('supply_temp')
+            temp_info = f"Supply temp: {supply_temp:.1f}C\n" if supply_temp else ""
+
             telegram_msg = (
                 f"<b>UMR2 ALERT</b>\n\n"
                 f"Error: {error_str}\n"
-                f"Supply temp: {data.get('supply_temp')}°C\n"
-                f"Return temp: {data.get('return_temp')}°C\n"
+                f"{temp_info}"
+                f"State: {data.get('state')}\n"
+                f"Message: {data.get('message')}\n"
                 f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
             )
             send_telegram_notification(telegram_msg)
     else:
         data['error'] = ''
-        # Clear last error when everything is OK
         if state.last_error is not None:
             state.last_error = None
-            # Optionally notify that error is cleared
             if TELEGRAM_ENABLED:
                 send_telegram_notification(
-                    f"<b>UMR2 OK</b>\n\nSystem returned to normal.\n"
-                    f"Supply temp: {data.get('supply_temp')}°C"
+                    f"<b>UMR2 OK</b>\n\nSystem returned to normal."
                 )
 
-    # Log to CSV
     log_to_csv(data, LOG_FILE)
-
-    # Print status line
     print(format_status_line(data, state, has_error, errors))
 
     return data
@@ -348,12 +369,12 @@ def poll_once(state: MonitorState) -> dict:
 
 def test_connection() -> bool:
     """Test connection to UMR2 and display current status."""
-    print(f"Testing connection to UMR2 at {UMR_URL}...")
+    print(f"Testing connection to UMR2 at http://{UMR_IP}/...")
     print()
 
-    html = fetch_umr_html()
+    raw_data = fetch_status()
 
-    if html is None:
+    if raw_data is None:
         print(f"{Colors.RED}FAILED{Colors.RESET} Could not connect to UMR2 at {UMR_IP}")
         print("Check that:")
         print(f"  - The UMR2 is powered on")
@@ -364,35 +385,35 @@ def test_connection() -> bool:
     print(f"{Colors.GREEN}Connection OK!{Colors.RESET}")
     print()
 
-    # Parse and display status
-    data = parse_umr_html(html)
-    errors = detect_errors(data, html)
+    data = parse_status_data(raw_data)
+    errors = detect_errors(data)
+
+    supply_temp = data.get('supply_temp')
+    return_temp = data.get('return_temp')
 
     print("Current Status:")
     print("-" * 50)
-    print(f"  Supply temperature:     {data.get('supply_temp', '?')}°C")
-    print(f"  Return temperature:     {data.get('return_temp', '?')}°C")
-    print(f"  Pump:                   {data.get('pump', '?')}")
-    print(f"  Heating factor:         {data.get('heating_factor', '?')}")
-    print(f"  Cooling factor:         {data.get('cooling_factor', '?')}")
-    print(f"  Operating mode:         {data.get('operating_mode', '?')}")
-    print(f"  CV status:              {data.get('cv_status', '?')}")
-    print(f"  Cooling machine:        {data.get('cooling_machine', '?')}")
-    print(f"  Max protection:         {data.get('max_protection', '?')}")
-    print(f"  Return limitation:      {data.get('return_limitation', '?')}")
-    print(f"  Condensation protection:{data.get('condensation_protection', '?')}")
-    print(f"  Status (display):       {data.get('status_display', '?')}")
-    print(f"  Status (description):   {data.get('status_description', '?')}")
+    print(f"  Supply temp:    {format_temp(supply_temp)} (aanvoer)")
+    print(f"  Return temp:    {format_temp(return_temp)} (retour)")
+    print(f"  State:          {data.get('state', '?')}")
+    print(f"  Message:        {data.get('message', '?')}")
+    print(f"  Mode:           {data.get('mode', '?')}")
+    print(f"  Heating factor: {data.get('heating_factor', '?')}")
+    print(f"  Cooling factor: {data.get('cooling_factor', '?')}")
+    print(f"  Pump speed:     {data.get('pump_speed', '?')}")
+    print(f"  Heater (CV):    {data.get('heater_state', '?')}")
+    print(f"  Cooler (KM):    {data.get('cooler_state', '?')}")
     print("-" * 50)
 
-    # Show thermostats and outputs
-    print("\nThermostats and Outputs:")
-    for n in range(1, 11):
-        therm = data.get(f'thermostat_{n}', '?')
-        out = data.get(f'output_{n}', '?')
-        if therm or out:  # Only show if we got data
-            print(f"  Thermostat {n:2d}: {therm:>5s}  |  Output {n:2d}: {out}")
+    print()
+    print(f"{Colors.YELLOW}E10 Limit:{Colors.RESET} Supply temp > {E10_TEMP_LIMIT}C triggers E10 error")
 
+    if supply_temp is not None:
+        margin = E10_TEMP_LIMIT - supply_temp
+        if margin > 0:
+            print(f"  Current margin: {margin:.1f}C below limit")
+        else:
+            print(f"  {Colors.RED}OVER LIMIT by {-margin:.1f}C!{Colors.RESET}")
     print()
 
     if errors:
@@ -410,10 +431,12 @@ def run_monitor():
     state = MonitorState()
 
     print(f"{Colors.BOLD}UMR2 Pro Monitor{Colors.RESET}")
-    print(f"Target: {UMR_URL}")
+    print(f"Target: http://{UMR_IP}/")
     print(f"Poll interval: {POLL_INTERVAL} seconds")
     print(f"Log file: {LOG_FILE}")
-    print(f"Telegram notifications: {'Enabled' if TELEGRAM_ENABLED else 'Disabled'}")
+    print(f"Telegram: {'Enabled' if TELEGRAM_ENABLED else 'Disabled'}")
+    print(f"E10 limit: {E10_TEMP_LIMIT}C")
+    print()
     print("-" * 60)
     print()
 
@@ -431,20 +454,19 @@ def run_monitor():
 
 def main():
     """Main entry point."""
+    global UMR_IP, POLL_INTERVAL
+
     parser = argparse.ArgumentParser(
-        description="UMR2 Pro Monitoring System - Monitor your underfloor heating controller",
+        description="UMR2 Pro Monitoring System",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   python umr2_monitor.py              Start monitoring
-  python umr2_monitor.py --test       Test connection and show current status
+  python umr2_monitor.py --test       Test connection and show status
 
-Configuration:
-  Edit the variables at the top of the script to change:
-  - UMR_IP: IP address of your UMR2 controller
-  - POLL_INTERVAL: How often to poll (seconds)
-  - LOG_FILE: Where to save CSV data
-  - TELEGRAM_*: Telegram notification settings
+Note:
+  Monitors supply temperature (aanvoertemperatuur) and triggers E10 alert
+  when it exceeds 55C. Also monitors state/message fields for error codes.
         """
     )
 
@@ -468,11 +490,8 @@ Configuration:
 
     args = parser.parse_args()
 
-    # Apply overrides
-    global UMR_IP, UMR_URL, POLL_INTERVAL
     if args.ip:
         UMR_IP = args.ip
-        UMR_URL = f"http://{UMR_IP}/"
     if args.interval:
         POLL_INTERVAL = args.interval
 
