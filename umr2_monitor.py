@@ -120,8 +120,8 @@ def fetch_status() -> Optional[dict]:
     # Fetch supply temperature (aanvoertemperatuur) - inputs.max
     supply_data = fetch_json("get.json?f=$.status.inputs.max.*")
 
-    # Fetch return temperature - inputs.return.temperature
-    return_data = fetch_json("get.json?f=$.status.inputs.return.temperature")
+    # Fetch return temperature - inputs.return
+    return_data = fetch_json("get.json?f=$.status.inputs.return.*")
 
     return {
         'main': main_data.get('status', {}).get('main', {}),
