@@ -5,8 +5,8 @@ Monitors a WTH UMR2 Pro underfloor heating controller via its JSON API.
 
 Features:
 - Polls status every 60 seconds via JSON API
-- Logs all data to CSV
-- Alerts on errors (E10, etc.) via main.message and main.state fields
+- Logs all data to CSV including temperatures
+- Alerts on errors (E10 when supply temp >55C, etc.)
 - Optional Telegram notifications
 """
 
@@ -29,6 +29,9 @@ POLL_INTERVAL = 60  # seconds
 LOG_FILE = "umr2_log.csv"
 ERROR_LOG_FILE = "umr2_errors.log"
 REQUEST_TIMEOUT = 10  # seconds
+
+# E10 temperature limit
+E10_TEMP_LIMIT = 55.0  # °C - supply temp above this triggers E10
 
 # Optional Telegram notifications
 TELEGRAM_ENABLED = False
@@ -57,6 +60,8 @@ class Colors:
 
 CSV_FIELDS = [
     'timestamp',
+    'supply_temp',     # aanvoertemperatuur (inputs.max.temperature)
+    'return_temp',     # retourtemperatuur (inputs.return.temperature)
     'state',           # main.state - "OK" or error
     'message',         # main.message - "OK" or error code like "E10"
     'mode',            # heating/cooling/off
@@ -112,16 +117,39 @@ def fetch_status() -> Optional[dict]:
     if outputs_data is None:
         return None
 
+    # Fetch supply temperature (aanvoertemperatuur) - inputs.max
+    supply_data = fetch_json("get.json?f=$.status.inputs.max.*")
+
+    # Fetch return temperature - inputs.return.temperature
+    return_data = fetch_json("get.json?f=$.status.inputs.return.temperature")
+
     return {
         'main': main_data.get('status', {}).get('main', {}),
         'outputs': outputs_data.get('status', {}).get('outputs', {}),
+        'supply': supply_data.get('status', {}).get('inputs', {}).get('max', {}) if supply_data else {},
+        'return': return_data.get('status', {}).get('inputs', {}).get('return', {}) if return_data else {},
     }
+
+
+def parse_temperature(value) -> Optional[float]:
+    """Parse temperature value, handling various formats."""
+    if value is None or value == '':
+        return None
+    try:
+        # Handle string with comma as decimal separator
+        if isinstance(value, str):
+            value = value.replace(',', '.')
+        return float(value)
+    except (ValueError, TypeError):
+        return None
 
 
 def parse_status_data(raw_data: dict) -> dict:
     """Parse raw API data into our normalized format."""
     main = raw_data.get('main', {})
     outputs = raw_data.get('outputs', {})
+    supply = raw_data.get('supply', {})
+    return_data = raw_data.get('return', {})
 
     # Mode translation
     mode_map = {
@@ -140,7 +168,13 @@ def parse_status_data(raw_data: dict) -> dict:
     cooler_state = outputs.get('cooler', {}).get('state', '')
     cooler_display = mode_map.get(cooler_state, cooler_state)
 
+    # Parse temperatures
+    supply_temp = parse_temperature(supply.get('temperature'))
+    return_temp = parse_temperature(return_data.get('temperature'))
+
     data = {
+        'supply_temp': supply_temp,
+        'return_temp': return_temp,
         'state': main.get('state', ''),
         'message': main.get('message', ''),
         'mode': mode_display,
@@ -158,6 +192,11 @@ def detect_errors(data: dict) -> list:
     """Detect error conditions from parsed data."""
     errors = []
 
+    # Check supply temperature for E10 condition
+    supply_temp = data.get('supply_temp')
+    if supply_temp is not None and supply_temp > E10_TEMP_LIMIT:
+        errors.append(f"E10(temp:{supply_temp:.1f}C)")
+
     # Check main state
     state = str(data.get('state', '')).upper()
     if state and state != 'OK':
@@ -169,6 +208,9 @@ def detect_errors(data: dict) -> list:
         # Check for known error codes
         for code in ERROR_CODES:
             if code in message:
+                # Don't duplicate E10 if we already detected it from temperature
+                if code == 'E10' and any('E10' in e for e in errors):
+                    continue
                 errors.append(code)
                 break
         else:
@@ -218,12 +260,19 @@ def send_telegram_notification(message: str) -> bool:
         return False
 
 
+def format_temp(temp: Optional[float]) -> str:
+    """Format temperature for display."""
+    if temp is None:
+        return "?"
+    return f"{temp:.1f}C"
+
+
 def format_status_line(data: dict, state: MonitorState, has_error: bool, errors: list) -> str:
     """Format a compact status line for console output."""
     timestamp = datetime.now().strftime("%H:%M:%S")
 
-    status = data.get('state', '?')
-    message = data.get('message', '?')
+    supply_temp = format_temp(data.get('supply_temp'))
+    return_temp = format_temp(data.get('return_temp'))
     mode = data.get('mode', '?')
     heat_factor = data.get('heating_factor', '?')
     pump = data.get('pump_speed', '?')
@@ -232,11 +281,11 @@ def format_status_line(data: dict, state: MonitorState, has_error: bool, errors:
     if has_error:
         status_icon = f"{Colors.RED}ERROR{Colors.RESET}"
         error_str = ', '.join(errors)
-        line = f"[{timestamp}] {status_icon} | Status: {status} | Msg: {message} | Mode: {mode} | Heat: {heat_factor} | Pump: {pump} | CV: {heater} | Polls: {state.poll_count}"
+        line = f"[{timestamp}] {status_icon} | Supply: {supply_temp} | Return: {return_temp} | Mode: {mode} | Heat: {heat_factor} | Pump: {pump} | CV: {heater} | Polls: {state.poll_count}"
         line += f"\n  {Colors.YELLOW}ALERT:{Colors.RESET} {error_str}"
     else:
         status_icon = f"{Colors.GREEN}OK{Colors.RESET}"
-        line = f"[{timestamp}] {status_icon} | Status: {status} | Msg: {message} | Mode: {mode} | Heat: {heat_factor} | Pump: {pump} | CV: {heater} | Polls: {state.poll_count}"
+        line = f"[{timestamp}] {status_icon} | Supply: {supply_temp} | Return: {return_temp} | Mode: {mode} | Heat: {heat_factor} | Pump: {pump} | CV: {heater} | Polls: {state.poll_count}"
 
     return line
 
@@ -291,9 +340,13 @@ def poll_once(state: MonitorState) -> dict:
             state.last_error = error_str
             state.last_error_time = datetime.now()
 
+            supply_temp = data.get('supply_temp')
+            temp_info = f"Supply temp: {supply_temp:.1f}C\n" if supply_temp else ""
+
             telegram_msg = (
                 f"<b>UMR2 ALERT</b>\n\n"
                 f"Error: {error_str}\n"
+                f"{temp_info}"
                 f"State: {data.get('state')}\n"
                 f"Message: {data.get('message')}\n"
                 f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
@@ -335,8 +388,13 @@ def test_connection() -> bool:
     data = parse_status_data(raw_data)
     errors = detect_errors(data)
 
+    supply_temp = data.get('supply_temp')
+    return_temp = data.get('return_temp')
+
     print("Current Status:")
     print("-" * 50)
+    print(f"  Supply temp:    {format_temp(supply_temp)} (aanvoer)")
+    print(f"  Return temp:    {format_temp(return_temp)} (retour)")
     print(f"  State:          {data.get('state', '?')}")
     print(f"  Message:        {data.get('message', '?')}")
     print(f"  Mode:           {data.get('mode', '?')}")
@@ -348,8 +406,14 @@ def test_connection() -> bool:
     print("-" * 50)
 
     print()
-    print(f"{Colors.YELLOW}Note:{Colors.RESET} Temperature sensors not available via API on this device.")
-    print("       E10 errors will be detected via the 'message' field.")
+    print(f"{Colors.YELLOW}E10 Limit:{Colors.RESET} Supply temp > {E10_TEMP_LIMIT}C triggers E10 error")
+
+    if supply_temp is not None:
+        margin = E10_TEMP_LIMIT - supply_temp
+        if margin > 0:
+            print(f"  Current margin: {margin:.1f}C below limit")
+        else:
+            print(f"  {Colors.RED}OVER LIMIT by {-margin:.1f}C!{Colors.RESET}")
     print()
 
     if errors:
@@ -371,8 +435,8 @@ def run_monitor():
     print(f"Poll interval: {POLL_INTERVAL} seconds")
     print(f"Log file: {LOG_FILE}")
     print(f"Telegram: {'Enabled' if TELEGRAM_ENABLED else 'Disabled'}")
+    print(f"E10 limit: {E10_TEMP_LIMIT}C")
     print()
-    print(f"{Colors.YELLOW}Note:{Colors.RESET} Monitoring state/message fields for E10 and other errors.")
     print("-" * 60)
     print()
 
@@ -401,9 +465,8 @@ Examples:
   python umr2_monitor.py --test       Test connection and show status
 
 Note:
-  This monitor detects E10 and other errors via the 'state' and 'message'
-  fields from the UMR2 JSON API. When an E10 error occurs (supply temp >55C),
-  the message field will show the error code.
+  Monitors supply temperature (aanvoertemperatuur) and triggers E10 alert
+  when it exceeds 55C. Also monitors state/message fields for error codes.
         """
     )
 
