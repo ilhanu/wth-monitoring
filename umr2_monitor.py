@@ -431,6 +431,8 @@ def run_monitor():
 
 def main():
     """Main entry point."""
+    global UMR_IP, UMR_URL, POLL_INTERVAL
+
     parser = argparse.ArgumentParser(
         description="UMR2 Pro Monitoring System - Monitor your underfloor heating controller",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -469,7 +471,6 @@ Configuration:
     args = parser.parse_args()
 
     # Apply overrides
-    global UMR_IP, UMR_URL, POLL_INTERVAL
     if args.ip:
         UMR_IP = args.ip
         UMR_URL = f"http://{UMR_IP}/"
