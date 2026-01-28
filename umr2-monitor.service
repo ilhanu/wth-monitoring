@@ -1,0 +1,27 @@
+[Unit]
+Description=UMR2 Pro Underfloor Heating Monitor
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+Group=pi
+WorkingDirectory=/home/pi/umr2-monitor
+ExecStart=/usr/bin/python3 /home/pi/umr2-monitor/umr2_monitor.py
+Restart=always
+RestartSec=10
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/pi/umr2-monitor
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
